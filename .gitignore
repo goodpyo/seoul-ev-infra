@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Environment variables (API 키 등 비밀)
+.env
+.env.local
+.streamlit/secrets.toml
+
+# 대용량 데이터 캐시 (API로 재생성 가능)
+data/seoul_chargers_api.json
+data/charger_dong_lookup.json
+
+# 원본 대용량 파일
+충전소 리스트.xlsx
+*.pptx
+
+# 디버깅 산출물
+analysis_output.txt
+search_result.txt
+addr_sample.txt
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
