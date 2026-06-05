@@ -1,3 +1,11 @@
+[server]
+headless = true
+runOnSave = true
+port = 8501
+
+[client]
+toolbarMode = "minimal"
+
 [theme]
 base            = "light"
 primaryColor    = "#2563eb"

@@ -6,9 +6,6 @@ import time
 import requests
 import pandas as pd
 from shapely.geometry import Point, shape
-from dotenv import load_dotenv
-
-load_dotenv()
 
 EV_FILE       = os.path.join(os.path.dirname(__file__), "서울시 자치구 읍면동별 연료별 자동차 등록현황(행정동)(26년4월).xlsx")
 CHARGER_EXCEL = os.path.join(os.path.dirname(__file__), "전기차 충전소 설치현황_20260512.xlsx")
@@ -28,8 +25,12 @@ DONG_GEOJSON_URL   = (
 DONG_GEOJSON_CACHE = os.path.join(os.path.dirname(__file__), "data", "seoul_dong.geojson")
 DONG_LOOKUP_CACHE  = os.path.join(os.path.dirname(__file__), "data", "charger_dong_lookup.json")
 
-API_KEY  = os.environ.get("EV_API_KEY", "")
+API_KEY  = "90fdcc2cbb43c6f75e133a15b94fd5cbdf7daa7ef9489cb516c11951c07548d8"
 BASE_URL = "http://apis.data.go.kr/B552584/EvCharger/getChargerInfo"
+
+# 가공 완료 Parquet 캐시 (두 번째 실행부터 JSON/Excel 파싱 완전 스킵)
+EV_PARQUET      = os.path.join(os.path.dirname(__file__), "data", "ev_processed.parquet")
+CHARGER_PARQUET = os.path.join(os.path.dirname(__file__), "data", "charger_processed.parquet")
 
 # 완속 타입 코드
 SLOW_TYPES = {"02", "07"}
@@ -136,14 +137,18 @@ def build_dong_lookup(charger_df: pd.DataFrame) -> dict:
             if poly.contains(pt):
                 matched = {"gu": gu, "dong": dong}
                 break
-        # 2차 fallback: 경계선에 걸리거나 폴리곤 틈새인 경우 가장 가까운 폴리곤
+        # 2차 fallback: 경계선 틈새인 경우 가장 가까운 폴리곤
+        # 단, 0.05도(약 5km) 초과 시 서울 외부로 판단하여 제외
         if matched is None:
             min_dist = float("inf")
+            best = None
             for gu, dong, poly in polygons:
                 d = poly.distance(pt)
                 if d < min_dist:
                     min_dist = d
-                    matched = {"gu": gu, "dong": dong}
+                    best = {"gu": gu, "dong": dong}
+            if best and min_dist <= 0.05:
+                matched = best
         if matched:
             lookup[row["stat_id"]] = matched
 
@@ -154,6 +159,31 @@ def build_dong_lookup(charger_df: pd.DataFrame) -> dict:
 
 
 # ─── GeoJSON ─────────────────────────────────────────────────────────────────
+def get_seoul_dong_geojson():
+    """행정동 경계 GeoJSON 반환. 각 feature에 'gu_dong' 속성 추가 (코로플레스 키용)."""
+    if not os.path.exists(DONG_GEOJSON_CACHE):
+        return None
+    with open(DONG_GEOJSON_CACHE, encoding="utf-8") as f:
+        data = json.load(f)
+    # 캐시에 비서울 지역이 포함될 수 있으므로 서울 25개 자치구만 필터링
+    filtered_feats = []
+    for feat in data.get("features", []):
+        props  = feat.setdefault("properties", {})
+        adm_nm = props.get("adm_nm", "")
+        if not adm_nm.startswith("서울"):
+            continue
+        parts = adm_nm.split()
+        if len(parts) < 3:
+            continue
+        gu = parts[1]
+        if gu not in SEOUL_GU:
+            continue
+        # "서울특별시 강남구 대치1동" → "강남구 대치1동"
+        props["gu_dong"] = f"{gu} {parts[2]}"
+        filtered_feats.append(feat)
+    return {"type": "FeatureCollection", "features": filtered_feats}
+
+
 def get_seoul_gu_geojson():
     os.makedirs(os.path.dirname(GEOJSON_CACHE), exist_ok=True)
     if os.path.exists(GEOJSON_CACHE):
@@ -257,6 +287,11 @@ def _parse_gu_dong(gu_full, dong_raw):
 
 
 def load_ev_data() -> pd.DataFrame:
+    # Parquet 캐시: 소스 Excel보다 최신이면 파싱 스킵
+    if os.path.exists(EV_PARQUET) and os.path.exists(EV_FILE):
+        if os.path.getmtime(EV_PARQUET) >= os.path.getmtime(EV_FILE):
+            return pd.read_parquet(EV_PARQUET)
+
     # pandas로 일괄 읽기 → openpyxl 순차 읽기 대비 빠름
     raw = pd.read_excel(EV_FILE, engine="openpyxl", skiprows=8, header=None)
     # 병합 셀 처리: 구(0열)·동(2열) 앞 값 전파
@@ -275,7 +310,10 @@ def load_ev_data() -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    return df.groupby(["gu", "dong"], as_index=False)["ev_count"].sum()
+    df = df.groupby(["gu", "dong"], as_index=False)["ev_count"].sum()
+    os.makedirs(os.path.dirname(EV_PARQUET), exist_ok=True)
+    df.to_parquet(EV_PARQUET, index=False)
+    return df
 
 
 # ─── 충전소 데이터 (Excel) ────────────────────────────────────────────────────
@@ -329,6 +367,11 @@ def _load_charger_excel() -> pd.DataFrame:
 # ─── 충전소 데이터 (API + Excel 통합) ────────────────────────────────────────
 def load_charger_data() -> pd.DataFrame:
     """API 캐시 + 설치현황 엑셀을 합쳐 반환. (GPS 있는 API 우선, 엑셀은 보완)"""
+    # Parquet 캐시: API JSON 캐시보다 최신이면 파싱 스킵
+    if os.path.exists(CHARGER_PARQUET) and os.path.exists(CHARGER_CACHE):
+        if os.path.getmtime(CHARGER_PARQUET) >= os.path.getmtime(CHARGER_CACHE):
+            return pd.read_parquet(CHARGER_PARQUET)
+
     items = fetch_seoul_chargers_api()
 
     rows = []
@@ -341,12 +384,12 @@ def load_charger_data() -> pd.DataFrame:
         gm   = _RE_GU.search(addr)
         gu   = gm.group(1) if gm else None
 
-        # 서울 25개 자치구가 아닌 경우 제외
-        if gu and gu not in SEOUL_GU:
+        # 서울 25개 자치구 확인 — gu=None(구 추출 실패)도 제외
+        if not gu or gu not in SEOUL_GU:
             continue
 
         # 구 이름 이후에서만 동 추출 (예: "성동구"→"성동", "강동구"→"강동" 오탐 방지)
-        rest = addr[gm.end():] if gm else addr
+        rest = addr[gm.end():]
         dm   = _RE_DONG.search(rest)
         dong = dm.group(1) if dm else None
 
@@ -355,6 +398,12 @@ def load_charger_data() -> pd.DataFrame:
             lon = float(item.get("lng") or 0)
         except (ValueError, TypeError):
             lat, lon = 0.0, 0.0
+
+        # GPS가 있는 경우, 서울 경계 밖이면 좌표를 0으로 무효화
+        # 서울 위도 37.25~37.75, 경도 126.65~127.35 (약간의 여유 포함)
+        if lat != 0 and lon != 0:
+            if not (37.25 <= lat <= 37.75 and 126.65 <= lon <= 127.35):
+                lat, lon = 0.0, 0.0
 
         ctype = str(item.get("chgerType", "")).strip()
         is_fast = ctype not in SLOW_TYPES
@@ -380,15 +429,13 @@ def load_charger_data() -> pd.DataFrame:
     if not api_df.empty:
         lookup = build_dong_lookup(api_df)
         if lookup:
-            # lookup에 있는 stat_id는 법정동 오추출 포함 → 무조건 GPS 결과로 덮어씀
+            # 벡터 매핑: apply(axis=1) 루프 대신 dict.map으로 일괄 치환
             gps_mask = api_df["stat_id"].isin(lookup)
-            def _apply_lookup(row):
-                if row["stat_id"] in lookup:
-                    info = lookup[row["stat_id"]]
-                    row["gu"]   = info["gu"]
-                    row["dong"] = info["dong"]
-                return row
-            api_df.loc[gps_mask] = api_df[gps_mask].apply(_apply_lookup, axis=1)
+            if gps_mask.any():
+                gu_map   = {sid: v["gu"]   for sid, v in lookup.items()}
+                dong_map = {sid: v["dong"] for sid, v in lookup.items()}
+                api_df.loc[gps_mask, "gu"]   = api_df.loc[gps_mask, "stat_id"].map(gu_map)
+                api_df.loc[gps_mask, "dong"] = api_df.loc[gps_mask, "stat_id"].map(dong_map)
 
     # 엑셀 데이터 보완 — API에 없는 충전소 추가
     xl_df = _load_charger_excel()
@@ -407,9 +454,13 @@ def load_charger_data() -> pd.DataFrame:
     ]
 
     if xl_new.empty:
-        return api_df
+        result = api_df
+    else:
+        result = pd.concat([api_df, xl_new], ignore_index=True)
 
-    return pd.concat([api_df, xl_new], ignore_index=True)
+    os.makedirs(os.path.dirname(CHARGER_PARQUET), exist_ok=True)
+    result.to_parquet(CHARGER_PARQUET, index=False)
+    return result
 
 
 # ─── 병합 & 지수 계산 ─────────────────────────────────────────────────────────
@@ -480,15 +531,49 @@ def aggregate_by_gu(charger_df: pd.DataFrame, ev_df: pd.DataFrame) -> pd.DataFra
 
 # ─── 사용자 위치 → 가까운 충전소 ─────────────────────────────────────────────
 def geocode_address(address: str):
+    """주소 → 좌표. 카카오 REST API 우선, 실패 시 Nominatim 폴백."""
+    # "서울시" → "서울특별시" 정규화 (카카오 API 인식률 향상)
+    addr = address.strip()
+    addr = addr.replace("서울시 ", "서울특별시 ").replace("서울시,", "서울특별시,")
+    query = addr if "서울" in addr else f"서울특별시 {addr}"
+
+    # 1차: 카카오 로컬 API (빠름, 한국 주소 정확)
+    try:
+        import requests as _req
+        resp = _req.get(
+            "https://dapi.kakao.com/v2/local/search/address.json",
+            headers={"Authorization": f"KakaoAK {os.environ.get('KAKAO_API_KEY', '')}"},
+            params={"query": query, "analyze_type": "similar"},
+            timeout=3,
+        )
+        if resp.status_code == 200:
+            docs = resp.json().get("documents", [])
+            if docs:
+                return float(docs[0]["y"]), float(docs[0]["x"])
+        # 주소 검색 실패 시 키워드 검색 시도 (건물명, 장소명 등)
+        resp2 = _req.get(
+            "https://dapi.kakao.com/v2/local/search/keyword.json",
+            headers={"Authorization": f"KakaoAK {os.environ.get('KAKAO_API_KEY', '')}"},
+            params={"query": query},
+            timeout=3,
+        )
+        if resp2.status_code == 200:
+            docs2 = resp2.json().get("documents", [])
+            if docs2:
+                return float(docs2[0]["y"]), float(docs2[0]["x"])
+    except Exception:
+        pass
+
+    # 2차 폴백: Nominatim
     try:
         from geopy.geocoders import Nominatim
         geolocator = Nominatim(user_agent="ev_infra_seoul", timeout=5)
-        query = address if "서울" in address else f"서울특별시 {address}"
         loc = geolocator.geocode(query, language="ko")
         if loc:
             return loc.latitude, loc.longitude
     except Exception:
         pass
+
     return None, None
 
 
