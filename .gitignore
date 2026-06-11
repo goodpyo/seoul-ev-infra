@@ -33,3 +33,13 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Node (PPT 생성용)
+node_modules/
+
+# 가공 캐시 (소스에서 재생성 가능)
+data/*.parquet
+
+# 임시 디버그 파일
+_check_*.py
+_rt_test.json

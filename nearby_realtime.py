@@ -22,9 +22,11 @@ _CLUSTER_KM = 0.030  # 30m 이내 → 같은 물리적 위치로 클러스터링
 
 
 def find_stations_within_radius(
-    lat: float, lon: float, charger_df: pd.DataFrame, radius_km: float = 5.0
+    lat: float, lon: float, charger_df: pd.DataFrame,
+    radius_km: float = 5.0, top_n: int = None
 ) -> pd.DataFrame:
     """반경 radius_km 이내 충전소를 거리 오름차순으로 반환.
+    top_n 지정 시 반경 제한 없이 가장 가까운 top_n개만 반환.
     30m 이내의 별도 등록 충전소(급속/완속 분리 등)는 하나로 클러스터링."""
     valid = charger_df[(charger_df["lat"] != 0) & (charger_df["lon"] != 0)]
 
@@ -50,11 +52,20 @@ def find_stations_within_radius(
     dlon  = lons2 - lon1
     a     = np.sin(dlat/2)**2 + math.cos(lat1) * np.cos(lats2) * np.sin(dlon/2)**2
     stations["distance_km"] = np.round(R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a)), 2)
-    nearby = (
-        stations[stations["distance_km"] <= radius_km]
-        .sort_values("distance_km")
-        .reset_index(drop=True)
-    )
+
+    if top_n:
+        # 클러스터링 후 top_n 반환 — 충분한 후보 확보 (top_n * 6 또는 최소 60개)
+        n_candidates = max(top_n * 6, 60)
+        nearby = (
+            stations.nsmallest(n_candidates, "distance_km")
+            .reset_index(drop=True)
+        )
+    else:
+        nearby = (
+            stations[stations["distance_km"] <= radius_km]
+            .sort_values("distance_km")
+            .reset_index(drop=True)
+        )
 
     if len(nearby) == 0:
         return nearby
@@ -92,7 +103,10 @@ def find_stations_within_radius(
             "distance_km": float(grp.iloc[0]["distance_km"]),
         })
 
-    return pd.DataFrame(merged_rows).sort_values("distance_km").reset_index(drop=True)
+    result = pd.DataFrame(merged_rows).sort_values("distance_km").reset_index(drop=True)
+    if top_n:
+        return result.head(top_n)
+    return result
 
 
 def _parse_items(resp_json: dict) -> list:

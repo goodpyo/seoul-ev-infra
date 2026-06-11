@@ -113,8 +113,11 @@ st.markdown("""
   }
   /* ── 본문: 헤더 높이만큼 아래로 ── */
   div.block-container {
-    padding-top: 7rem !important;
+    padding-top: 6.3rem !important;
+    padding-bottom: 1rem !important;
   }
+  /* KPI 메트릭 값 크기 축소 (세로 공간 절약) */
+  div[data-testid="stMetricValue"] { font-size: 1.6rem !important; }
   /* ── 인라인 배너 숨기기 (헤더에서 대체) ── */
   div[data-testid="stMarkdownContainer"]:has(#app-header) {
     display: none !important;
@@ -178,6 +181,43 @@ def load_dong_geojson():
 dong_geojson = load_dong_geojson()
 
 
+@st.cache_data(show_spinner=False)
+def get_dong_centroids():
+    """행정동 폴리곤 중심 좌표 {gu_dong: (lat, lon)} — 부족 동 클릭 시 지도 이동용."""
+    cents = {}
+    if not dong_geojson:
+        return cents
+    for feat in dong_geojson.get("features", []):
+        name = feat.get("properties", {}).get("gu_dong", "")
+        geom = feat.get("geometry", {})
+        coords = []
+        if geom.get("type") == "Polygon":
+            coords = geom["coordinates"][0]
+        elif geom.get("type") == "MultiPolygon":
+            for poly in geom["coordinates"]:
+                coords.extend(poly[0])
+        if name and coords:
+            lons = [c[0] for c in coords]
+            lats = [c[1] for c in coords]
+            cents[name] = (sum(lats) / len(lats), sum(lons) / len(lons))
+    return cents
+
+
+dong_centroids = get_dong_centroids()
+
+
+def find_dong_centroid(gu_dong: str):
+    """행정동 중심 좌표 조회. 정확히 없으면 분동된 동(상일동→상일제1동 등)으로 폴백."""
+    if gu_dong in dong_centroids:
+        return dong_centroids[gu_dong]
+    # 폴백: '강동구 상일동' → '강동구 상일'로 시작하는 동 (상일제1동 등)
+    stem = gu_dong[:-1] if gu_dong.endswith("동") else gu_dong
+    for key, cent in dong_centroids.items():
+        if key.startswith(stem):
+            return cent
+    return None
+
+
 @st.cache_data
 def get_stations_map(_charger_df):
     """충전소 단위 집계 — 캐시하여 매 re-run 재계산 방지."""
@@ -231,6 +271,13 @@ with st.sidebar:
         "지도 표시 모드",
         ["부족지수 (전기차/충전기)", "충전편의지수", "전기차 등록 수", "충전기 설치 수"],
         index=0,
+        help=(
+            "**부족지수** = 전기차 등록 수 ÷ 충전기 수\n\n"
+            "충전기 1기가 감당하는 전기차 대수 — 클수록 부족\n\n"
+            "---\n\n"
+            "**충전편의지수** = (급속×3 + 완속) ÷ 전기차 × 100\n\n"
+            "급속은 충전 속도를 감안해 3배 가중 — 클수록 편리"
+        ),
     )
 
     st.divider()
@@ -241,7 +288,7 @@ with st.sidebar:
     if "부족지수" in map_mode:
         for label, color in [("매우 부족 (>20)", "#d73027"), ("부족 (>10)", "#fc8d59"),
                               ("보통 (>5)", "#fee090"), ("충분 (≤5)", "#1a9850"),
-                              ("충전소 없음", "#aaaaaa")]:
+                              ("데이터 없음", "#aaaaaa")]:
             st.markdown(f"<span style='color:{color}'>■</span> {label}", unsafe_allow_html=True)
     elif "편의지수" in map_mode:
         for label, color in [("매우 좋음 (≥30)", "#1a9850"), ("좋음 (≥15)", "#a3d977"),
@@ -285,7 +332,7 @@ with main_tab1:
     total_chargers = int(charger_df["total_count"].sum())
     total_fast     = int(charger_df["fast_count"].sum())
     total_slow     = int(charger_df["slow_count"].sum())
-    shortage_dongs = int((merged_df["status"].isin(["충전소 없음", "매우 부족", "부족"])).sum())
+    shortage_dongs = int((merged_df["status"].isin(["매우 부족", "부족"])).sum())
 
     k1.metric("전기차 등록 대수", f"{total_ev:,} 대",
               help="2026년 4월 기준 — 자동차관리정보시스템 (국토교통부)")
@@ -296,15 +343,34 @@ with main_tab1:
     k4.metric("완속 충전기", f"{total_slow:,} 기",
               help="2026년 5월 12일 기준 — 한국환경공단 API")
     k5.metric("인프라 부족 동 수", f"{shortage_dongs} 곳",
-              delta="충전소 없음 + 매우 부족", delta_color="inverse")
+              delta="부족 + 매우 부족", delta_color="inverse")
 
-    st.divider()
+    # ── 부족 동 목록 (잔여 버킷 제외) ─────────────────────────────────────────
+    # 행정구역 개편 잔여 버킷 제외 — 옛 동명으로 남은 등록 데이터 조각이라
+    # 실제 부족이 아님 (예: 상일동 41대 — 상일제1·2동은 충분)
+    ARTIFACT_DONGS = {("강동구", "상일동")}
+    shortage_dongs_df = (
+        merged_df[
+            (merged_df["ev_count"] > 0)
+            & ~merged_df.apply(lambda r: (r["gu"], r["dong"]) in ARTIFACT_DONGS, axis=1)
+        ]
+        .sort_values("shortage_idx", ascending=False)
+        .head(20).copy()
+    )
+
+    # 📍 버튼 클릭을 지도 렌더 전에 처리 — st.rerun() 없이 한 번에 이동
+    if st.session_state.get("dong_focus_reset"):
+        st.session_state.pop("dong_focus", None)
+    else:
+        for _, _r in shortage_dongs_df.iterrows():
+            _gd = f"{_r['gu']} {_r['dong']}"
+            if st.session_state.get(f"dong_focus_{_gd}"):
+                st.session_state["dong_focus"] = _gd
+                break
 
     col_map, col_panel = st.columns([2, 1])
 
     with col_map:
-        st.subheader(f"🗺️ {map_mode} 지도")
-
         SEOUL_BOUNDS    = [[37.413, 126.734], [37.716, 127.270]]
         SEOUL_MAXBOUNDS = [[37.35, 126.65], [37.78, 127.36]]
 
@@ -318,30 +384,45 @@ with main_tab1:
         else:
             key_col = "charger_total"
 
-        # ── 표시 단위 토글 (자치구 / 행정동) — 부족·편의지수에서만 ──────────
+        # ── 제목 + 표시 단위 토글을 한 줄로 배치 ───────────────────────────
         dong_available = dong_geojson is not None and (
             "부족지수" in map_mode or "편의지수" in map_mode
         )
+        title_col, radio_col = st.columns([3.4, 1.25], vertical_alignment="center")
+        title_col.markdown(
+            f"<div style='font-size:1.15rem;color:#1e293b;'>🗺️ {map_mode} 지도</div>",
+            unsafe_allow_html=True,
+        )
         if dong_available:
-            granularity = st.radio(
-                "표시 단위",
-                ["자치구별", "행정동별"],
-                horizontal=True,
-                key="map_granularity",
-            )
+            with radio_col:
+                granularity = st.radio(
+                    "표시 단위",
+                    ["자치구별", "행정동별"],
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    key="map_granularity",
+                )
         else:
             granularity = "자치구별"
         dong_mode = (granularity == "행정동별") and dong_available
 
+        # 부족 동 클릭 시 해당 동 중심으로 이동·확대
+        focus_gd   = st.session_state.get("dong_focus") if dong_mode else None
+        focus_cent = find_dong_centroid(focus_gd) if focus_gd else None
+        if focus_cent:
+            map_center, map_zoom = focus_cent, 14
+        else:
+            # fit_bounds 대신 고정 zoom 11 — 서울시가 화면에 꽉 차게 시작
+            map_center, map_zoom = [37.5665, 126.9780], 11
+
         m = folium.Map(
-            location=[37.5665, 126.9780],
-            zoom_start=11,
+            location=map_center,
+            zoom_start=map_zoom,
             tiles="OpenStreetMap",
             min_zoom=10, max_zoom=18,
             maxBounds=SEOUL_MAXBOUNDS,
             maxBoundsViscosity=1.0,
         )
-        m.fit_bounds(SEOUL_BOUNDS)
 
         if dong_mode:
             # ── 행정동 단위 ──────────────────────────────────────────────────
@@ -395,8 +476,9 @@ with main_tab1:
                 if ev == 0:
                     continue
                 col = _dong_color(gd)
+                idx_label = "부족지수" if "부족지수" in map_mode else "편의지수"
                 tip = (f"{dr['gu']} {dr['dong']}<br>"
-                       f"{key_col}: {val} | 전기차 {ev:,}대 | 충전기 {tot}기")
+                       f"{idx_label} {val} | 전기차 {ev:,}대 | 충전기 {tot}기")
                 folium.CircleMarker(
                     location=[dr["lat"], dr["lon"]],
                     radius=max(5, min(16, ev / 150)),
@@ -513,22 +595,17 @@ with main_tab1:
             ).add_to(m)
 
         # returned_objects=[] → 지도 상호작용(이동/확대) 시 새로고침 없음
-        st_folium(m, width=None, height=600, returned_objects=[], key="infra_map")
+        st_folium(m, width=None, height=540, returned_objects=[], key="infra_map")
 
         if "편의지수" in map_mode:
             st.caption("💡 편의지수는 자치구 평균입니다. 실제 충전소 위치(클러스터)가 함께 표시됩니다.")
 
     with col_panel:
-        panel_view = st.radio(
-            "패널",
-            ["🏙️ 자치구별", "⚠️ 부족 동"],
-            horizontal=True,
-            label_visibility="collapsed",
-            key="panel_view",
-        )
+        # 지도 표시 단위와 패널 연동 — 자치구별 → 자치구 요약 / 행정동별 → 부족 동 목록
+        panel_view = "⚠️ 부족 동" if dong_mode else "🏙️ 자치구별"
 
         if panel_view == "🏙️ 자치구별":
-            st.caption("자치구별 요약 (부족지수 순)")
+            st.caption("자치구별 요약 · 부족지수 순")
             display_gu = gu_df.sort_values("shortage_idx", ascending=False).copy()
             display_gu = display_gu.rename(columns={
                 "gu": "자치구", "ev_count": "전기차(대)",
@@ -537,26 +614,34 @@ with main_tab1:
             })
             st.dataframe(
                 display_gu[["자치구", "전기차(대)", "충전기(기)", "부족지수", "편의지수"]],
-                use_container_width=True, hide_index=True, height=520,
+                use_container_width=True, hide_index=True, height=560,
             )
 
         elif panel_view == "⚠️ 부족 동":
-            st.caption("인프라 부족 행정동 (부족지수 상위 20개)")
-            shortage_dongs_df = (
-                merged_df[merged_df["ev_count"] > 0]
-                .sort_values("shortage_idx", ascending=False)
-                .head(20).copy()
-            )
+            st.caption("인프라 부족 행정동 · 부족지수 상위 20개")
+            focused = st.session_state.get("dong_focus")
             for _, r in shortage_dongs_df.iterrows():
-                pill = STATUS_PILL.get(r["status"], "pill-gray")
-                st.markdown(
-                    f"**{r['gu']} {r['dong']}** &nbsp;"
+                pill   = STATUS_PILL.get(r["status"], "pill-gray")
+                gd     = f"{r['gu']} {r['dong']}"
+                in_map = find_dong_centroid(gd) is not None
+                txt_col, btn_col = st.columns([5, 1], vertical_alignment="center")
+                txt_col.markdown(
+                    f"**{gd}** &nbsp;"
                     f"<span class='status-pill {pill}'>{r['status']}</span><br>"
                     f"<small>전기차 {r['ev_count']:,}대 | 충전기 {r['charger_total']}기 | "
                     f"부족지수 {r['shortage_idx']}</small>",
                     unsafe_allow_html=True,
                 )
+                if in_map:
+                    btn_type = "primary" if focused == gd else "secondary"
+                    # 클릭 처리는 지도 렌더 전(상단)에서 수행 — 여기서는 표시만
+                    btn_col.button("📍", key=f"dong_focus_{gd}",
+                                   type=btn_type, help=f"{gd} 지도에서 보기")
                 st.divider()
+
+            if focused:
+                st.button("🗺️ 서울 전체 보기", use_container_width=True,
+                          key="dong_focus_reset")
 
 
     st.divider()
@@ -564,8 +649,8 @@ with main_tab1:
     with st.expander("📋 전체 행정동별 상세 데이터"):
         filter_status = st.multiselect(
             "상태 필터",
-            options=["충전소 없음", "매우 부족", "부족", "보통", "충분", "해당없음"],
-            default=["충전소 없음", "매우 부족", "부족"],
+            options=["매우 부족", "부족", "보통", "충분", "해당없음"],
+            default=["매우 부족", "부족"],
         )
         filtered = merged_df[merged_df["status"].isin(filter_status)] if filter_status else merged_df
         display  = filtered[["gu", "dong", "ev_count", "charger_total", "fast_total",
@@ -581,45 +666,54 @@ with main_tab1:
 # ═══════════════════════════════════════════════════════════════════════════════
 # 탭 2: 가까운 충전소 찾기
 # ═══════════════════════════════════════════════════════════════════════════════
-NEARBY_RADIUS_KM = 0.10   # 100m
+NEARBY_TOP_N = 3   # 가장 가까운 N개 충전소
 
 with main_tab2:
-    st.subheader("🔌 가까운 충전소 찾기")
-    st.caption("내 위치를 기준으로 반경 100m 내 충전소의 급속·완속 현황을 확인하세요.")
-
-    # ─── 위치 입력 ─────────────────────────────────────────────────────────────
-    nb_mode = st.radio(
-        "위치 입력 방법",
-        ["현재 위치 자동 감지", "주소 입력"],
-        horizontal=True,
-        key="nb_mode",
-    )
+    # ─── 위치 입력 (안내 + 입력 방법을 한 줄로 — 인프라 분석과 동일한 톤) ──────
+    cap_col, mode_col = st.columns([3, 2], vertical_alignment="center")
+    cap_col.caption("내 위치에서 가장 가까운 충전소 3곳의 급속·완속 현황을 확인하세요.")
+    with mode_col:
+        nb_mode = st.radio(
+            "위치 입력 방법",
+            ["현재 위치 자동 감지", "주소 입력"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="nb_mode",
+        )
 
     nb_search = False
 
     if nb_mode == "현재 위치 자동 감지":
         geo_data = get_geolocation()
         if geo_data and geo_data.get("coords"):
-            auto_lat = geo_data["coords"]["latitude"]
-            auto_lon = geo_data["coords"]["longitude"]
+            auto_lat = float(geo_data["coords"]["latitude"])
+            auto_lon = float(geo_data["coords"]["longitude"])
             acc      = geo_data["coords"].get("accuracy", 0)
             st.success(f"위치 감지 완료 — 위도 {auto_lat:.5f}, 경도 {auto_lon:.5f}  (정확도 ±{acc:.0f}m)")
             st.session_state["nb_center_lat"] = auto_lat
             st.session_state["nb_center_lon"] = auto_lon
+            # 좌표가 있으면 매 run마다 즉시 계산 (벡터 연산이라 ~수 ms, 캐시 불필요)
+            st.session_state["nb_nearby_df"] = find_stations_within_radius(
+                auto_lat, auto_lon, charger_df, top_n=NEARBY_TOP_N
+            )
+            # 새 좌표 → 가장 가까운 1번 충전소로 지도 이동
             prev = st.session_state.get("nb_geo_prev")
             if prev != (auto_lat, auto_lon):
-                st.session_state["nb_geo_prev"]  = (auto_lat, auto_lon)
-                st.session_state["nb_nearby_df"] = find_stations_within_radius(
-                    auto_lat, auto_lon, charger_df, NEARBY_RADIUS_KM
-                )
+                st.session_state["nb_geo_prev"]     = (auto_lat, auto_lon)
+                st.session_state["nb_selected_idx"] = 0
+        else:
+            st.info("브라우저에서 위치 권한을 허용해주세요. 감지에 몇 초 걸릴 수 있습니다.")
     else:
-        nb_addr_col, nb_btn_col = st.columns([5, 1])
-        nb_addr_col.text_input(
-            "주소", placeholder="예: 금천구청 / 마포구 서교동 어울마당로",
-            label_visibility="collapsed", key="nb_addr",
-        )
-        nb_search = nb_btn_col.button("📍 검색", use_container_width=True,
-                                      type="primary", key="nb_srch")
+        # form으로 묶어 Enter 입력도 검색으로 처리
+        with st.form("nb_addr_form", border=False):
+            nb_addr_col, nb_btn_col = st.columns([5, 1])
+            nb_addr_col.text_input(
+                "주소", placeholder="예: 금천구청 / 마포구 서교동 어울마당로",
+                label_visibility="collapsed", key="nb_addr",
+            )
+            nb_search = nb_btn_col.form_submit_button(
+                "📍 검색", use_container_width=True, type="primary"
+            )
 
     # ─── 수동 검색 처리 ────────────────────────────────────────────────────────
     if nb_search:
@@ -628,64 +722,101 @@ with main_tab2:
             with st.spinner("위치 검색 중..."):
                 found_lat, found_lon = geocode_address(nb_address_val)
             if found_lat:
-                st.session_state["nb_center_lat"] = found_lat
-                st.session_state["nb_center_lon"] = found_lon
-                with st.spinner("반경 100m 내 충전소 검색 중..."):
+                st.session_state["nb_center_lat"]  = found_lat
+                st.session_state["nb_center_lon"]  = found_lon
+                with st.spinner("가장 가까운 충전소 검색 중..."):
                     st.session_state["nb_nearby_df"] = find_stations_within_radius(
-                        found_lat, found_lon, charger_df, NEARBY_RADIUS_KM
+                        found_lat, found_lon, charger_df, top_n=NEARBY_TOP_N
                     )
+                st.session_state["nb_selected_idx"] = 0   # 가장 가까운 곳으로 이동
             else:
                 st.error("주소를 찾을 수 없습니다. 더 구체적인 주소를 입력해주세요.")
         else:
             st.warning("주소를 입력해주세요.")
 
-    # ─── 상태 참조 ─────────────────────────────────────────────────────────────
-    nb_clat   = st.session_state.get("nb_center_lat", 37.5665)
-    nb_clon   = st.session_state.get("nb_center_lon", 126.9780)
-    nb_nearby = st.session_state.get("nb_nearby_df")
+    # ─── 카드 📍 버튼 클릭을 지도 렌더 전에 처리 — 한 번에 이동 ────────────────
+    if st.session_state.get("nb_show_all"):
+        st.session_state.pop("nb_selected_idx", None)
+    else:
+        for _i in range(NEARBY_TOP_N):
+            if st.session_state.get(f"nb_sel_{_i}"):
+                st.session_state["nb_selected_idx"] = _i
+                break
 
-    # ─── 지도 + 목록 ───────────────────────────────────────────────────────────
-    map_col, list_col = st.columns([3, 2])
+    # ─── 상태 참조 ─────────────────────────────────────────────────────────────
+    nb_clat        = st.session_state.get("nb_center_lat", 37.5665)
+    nb_clon        = st.session_state.get("nb_center_lon", 126.9780)
+    nb_nearby      = st.session_state.get("nb_nearby_df")
+    nb_sel_idx     = st.session_state.get("nb_selected_idx")   # 우측 카드에서 선택한 인덱스
+
+    # ─── 지도 중심 결정 ────────────────────────────────────────────────────────
+    # 카드 클릭 → 해당 충전소 중심 / 미선택 → fit_bounds 사용
+    if (nb_sel_idx is not None
+            and nb_nearby is not None
+            and nb_sel_idx < len(nb_nearby)):
+        sel_row   = nb_nearby.iloc[nb_sel_idx]
+        map_lat   = float(sel_row["lat"])
+        map_lon   = float(sel_row["lon"])
+        map_zoom  = 17
+        use_fit   = False
+    else:
+        map_lat, map_lon, map_zoom = nb_clat, nb_clon, 15
+        use_fit   = nb_nearby is not None and len(nb_nearby) > 0
+
+    # ─── 지도 + 목록 (인프라 분석 탭과 동일한 2:1 레이아웃) ────────────────────
+    map_col, list_col = st.columns([2, 1])
 
     def _dist_str(km: float) -> str:
         m = km * 1000
         return f"{m:.0f}m" if m < 1000 else f"{km:.2f}km"
 
+    # 번호별 색상 (1=파랑, 2=초록, 3=보라)
+    _NUM_COLORS = [
+        ("#2563eb", "#1e40af"),   # 1번
+        ("#059669", "#065f46"),   # 2번
+        ("#7c3aed", "#4c1d95"),   # 3번
+    ]
+
     with map_col:
+        st.markdown(
+            "<div style='font-size:1.15rem;color:#1e293b;'>🗺️ 가까운 충전소 지도</div>",
+            unsafe_allow_html=True,
+        )
         nb_map = folium.Map(
-            location=[nb_clat, nb_clon],
-            zoom_start=18,
+            location=[map_lat, map_lon],
+            zoom_start=map_zoom,
             tiles="OpenStreetMap",
         )
 
-        # 100m 반경 원
-        folium.Circle(
-            location=[nb_clat, nb_clon],
-            radius=100,
-            color="#3b82f6",
-            fill=True, fill_color="#3b82f6", fill_opacity=0.08,
-            weight=2, dash_array="6",
-        ).add_to(nb_map)
-
-        # 내 위치 마커
+        # 검색 위치 마커
         folium.Marker(
             location=[nb_clat, nb_clon],
-            popup="내 위치",
+            popup="검색 위치",
             icon=folium.Icon(color="red", icon="user", prefix="fa"),
-            tooltip="내 위치",
+            tooltip="📍 검색 위치",
         ).add_to(nb_map)
 
-        # 충전소 마커
+        # 충전소 번호 마커 (1·2·3)
         if nb_nearby is not None and len(nb_nearby) > 0:
-            for _, row in nb_nearby.iterrows():
-                dist_label  = _dist_str(row["distance_km"])
-                total       = int(row["fast_count"] + row["slow_count"])
-                has_fast    = row["fast_count"] > 0
-                bg, border  = ("#2563eb", "#1e40af") if has_fast else ("#64748b", "#334155")
-                label       = f"{total}기"
-                popup_html  = (
-                    f"<div style='font-family:sans-serif;min-width:200px'>"
-                    f"<b>{row['location']}</b><br>"
+            for i, row in nb_nearby.reset_index(drop=True).iterrows():
+                dist_label = _dist_str(row["distance_km"])
+                bg, border = _NUM_COLORS[i % len(_NUM_COLORS)]
+                is_sel     = (nb_sel_idx == i)
+                # 선택된 카드는 테두리 강조
+                ring = f"box-shadow:0 0 0 3px #fbbf24,0 2px 8px rgba(0,0,0,.45);" if is_sel else "box-shadow:0 2px 5px rgba(0,0,0,.35);"
+                icon_html = (
+                    f"<div style='background:{bg};color:#fff;"
+                    f"border-radius:50%;width:40px;height:40px;"
+                    f"display:flex;flex-direction:column;align-items:center;"
+                    f"justify-content:center;font-weight:700;"
+                    f"border:2px solid {border};{ring}'>"
+                    f"<span style='font-size:14px;line-height:1.1;'>{i+1}</span>"
+                    f"<span style='font-size:7px;line-height:1.1;opacity:.9;'>충전소</span>"
+                    f"</div>"
+                )
+                popup_html = (
+                    f"<div style='font-family:sans-serif;min-width:210px'>"
+                    f"<b>#{i+1} {row['location']}</b><br>"
                     f"<small>{row['address']}</small><br>"
                     f"<small>거리: {dist_label}</small>"
                     f"<hr style='margin:4px 0'>"
@@ -693,62 +824,93 @@ with main_tab2:
                     f"🔋 완속 <b>{row['slow_count']}기</b>"
                     f"</div>"
                 )
-                icon_html = (
-                    f"<div style='background:{bg};color:#fff;"
-                    f"border-radius:50%;width:38px;height:38px;"
-                    f"line-height:38px;text-align:center;"
-                    f"font-size:11px;font-weight:700;"
-                    f"border:2px solid {border};"
-                    f"box-shadow:0 2px 5px rgba(0,0,0,.35);'>{label}</div>"
-                )
                 folium.Marker(
                     location=[row["lat"], row["lon"]],
-                    popup=folium.Popup(popup_html, max_width=260),
-                    tooltip=f"{row['location']} ({dist_label})",
-                    icon=folium.DivIcon(html=icon_html, icon_size=(38, 38), icon_anchor=(19, 19)),
+                    popup=folium.Popup(popup_html, max_width=270),
+                    tooltip=f"#{i+1} {row['location']} ({dist_label})",
+                    icon=folium.DivIcon(html=icon_html, icon_size=(40, 40), icon_anchor=(20, 20)),
                 ).add_to(nb_map)
 
-        st_folium(nb_map, width=None, height=520, returned_objects=[], key="nb_folium_map")
+            # 미선택 상태 → 3곳 + 검색위치 모두 보이도록 fit
+            if use_fit:
+                all_lats = [nb_clat] + nb_nearby["lat"].tolist()
+                all_lons = [nb_clon] + nb_nearby["lon"].tolist()
+                pad = 0.002
+                nb_map.fit_bounds(
+                    [[min(all_lats) - pad, min(all_lons) - pad],
+                     [max(all_lats) + pad, max(all_lons) + pad]]
+                )
+
+        st_folium(nb_map, width=None, height=540, returned_objects=[], key="nb_folium_map")
         st.markdown(
             "<small>"
-            "<span style='color:#2563eb'>●</span> 급속 포함 &nbsp;&nbsp;"
-            "<span style='color:#64748b'>●</span> 완속 전용"
+            "<span style='color:#2563eb'>●</span> 1번째 &nbsp;"
+            "<span style='color:#059669'>●</span> 2번째 &nbsp;"
+            "<span style='color:#7c3aed'>●</span> 3번째 &nbsp;&nbsp;"
+            "<span style='color:#ef4444'>●</span> 검색위치"
             "</small>",
             unsafe_allow_html=True,
         )
 
     # ─── 충전소 목록 ───────────────────────────────────────────────────────────
     with list_col:
+        st.caption("가장 가까운 충전소 TOP 3 · 거리순")
         if nb_nearby is None:
-            st.info("위치를 입력하고 검색하면\n반경 100m 내 충전소가 표시됩니다.")
+            st.info("위치를 입력하고 검색하면\n가장 가까운 충전소 3곳이 표시됩니다.")
         elif len(nb_nearby) == 0:
-            st.warning("반경 100m 내 충전소가 없습니다.")
+            st.warning("주변에 충전소가 없습니다.")
         else:
-            total_stations = len(nb_nearby)
-            total_fast_c   = int(nb_nearby["fast_count"].sum())
-            total_slow_c   = int(nb_nearby["slow_count"].sum())
-            kc1, kc2, kc3  = st.columns(3)
-            kc1.metric("반경 100m 충전소", f"{total_stations}개")
+            total_fast_c  = int(nb_nearby["fast_count"].sum())
+            total_slow_c  = int(nb_nearby["slow_count"].sum())
+            kc1, kc2, kc3 = st.columns(3)
+            kc1.metric("검색 결과", f"{len(nb_nearby)}개소")
             kc2.metric("급속 충전기", f"{total_fast_c}기")
             kc3.metric("완속 충전기", f"{total_slow_c}기")
 
             st.divider()
+            st.caption("📍 버튼을 클릭하면 해당 충전소로 지도가 이동합니다.")
 
-            for _, row in nb_nearby.iterrows():
+            for i, row in nb_nearby.reset_index(drop=True).iterrows():
                 dist_label = _dist_str(row["distance_km"])
+                bg, _      = _NUM_COLORS[i % len(_NUM_COLORS)]
+                is_sel     = (nb_sel_idx == i)
+                border_css = "border: 2px solid #fbbf24;" if is_sel else ""
+
                 with st.container(border=True):
+                    # 선택 강조 줄
+                    if is_sel:
+                        st.markdown(
+                            f"<div style='height:3px;background:{bg};border-radius:2px;margin-bottom:6px'></div>",
+                            unsafe_allow_html=True,
+                        )
+                    hd_col, btn_col = st.columns([5, 1])
+                    with hd_col:
+                        st.markdown(
+                            f"<span style='background:{bg};color:#fff;border-radius:50%;"
+                            f"width:22px;height:22px;display:inline-flex;align-items:center;"
+                            f"justify-content:center;font-weight:700;font-size:12px;"
+                            f"margin-right:6px;'>{i+1}</span>"
+                            f"**{row['location']}**",
+                            unsafe_allow_html=True,
+                        )
+                    with btn_col:
+                        # 클릭 처리는 지도 렌더 전(상단)에서 수행 — 여기서는 표시만
+                        st.button("📍", key=f"nb_sel_{i}", help="지도에서 이 충전소 보기")
+
                     st.markdown(
-                        f"**{row['location']}**  \n"
-                        f"<small style='color:#64748b'>📍 {row['address']}</small>",
+                        f"<small style='color:#64748b'>{row['address']}</small>",
                         unsafe_allow_html=True,
                     )
                     st.markdown(
-                        f"<div style='margin:4px 0'>"
-                        f"⚡ 급속 <b>{row['fast_count']}기</b> &nbsp;|&nbsp; "
-                        f"🔋 완속 <b>{row['slow_count']}기</b>"
-                        f"</div>",
+                        f"⚡ 급속 **{row['fast_count']}기** &nbsp;|&nbsp; "
+                        f"🔋 완속 **{row['slow_count']}기** &nbsp;&nbsp; "
+                        f"<span style='color:#64748b;font-size:0.85em'>📏 {dist_label}</span>",
                         unsafe_allow_html=True,
                     )
-                    st.caption(f"📏 {dist_label}")
+
+            # 전체 보기 버튼
+            if nb_sel_idx is not None:
+                st.divider()
+                st.button("🗺️ 3곳 전체 보기", use_container_width=True, key="nb_show_all")
 
 

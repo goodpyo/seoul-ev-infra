@@ -437,26 +437,12 @@ def load_charger_data() -> pd.DataFrame:
                 api_df.loc[gps_mask, "gu"]   = api_df.loc[gps_mask, "stat_id"].map(gu_map)
                 api_df.loc[gps_mask, "dong"] = api_df.loc[gps_mask, "stat_id"].map(dong_map)
 
-    # 엑셀 데이터 보완 — API에 없는 충전소 추가
-    xl_df = _load_charger_excel()
-    if xl_df.empty:
-        return api_df
-
-    # 중복 제거: API에 이미 같은 (gu, dong, location) 있으면 엑셀 행 제외
-    api_keys = set(
-        zip(api_df["gu"].fillna(""), api_df["dong"].fillna(""), api_df["location"])
-    )
-    xl_new = xl_df[
-        ~xl_df.apply(
-            lambda r: (r["gu"] or "", r["dong"] or "", r["location"]) in api_keys,
-            axis=1,
-        )
-    ]
-
-    if xl_new.empty:
-        result = api_df
-    else:
-        result = pd.concat([api_df, xl_new], ignore_index=True)
+    # ── 엑셀 보완 미사용 (정책 결정) ────────────────────────────────────────
+    # 엑셀 보완분(~586기, 전체 0.8%)은 GPS가 없어 법정동명으로만 라벨 →
+    # 행정동 미배정 노이즈의 주원인이었음. API 단일 소스(GPS 기반 행정동
+    # 정밀 매핑)가 신뢰도 면에서 우수하다고 판단해 제외.
+    # 엑셀은 검증·교차 대조용으로만 활용 (_load_charger_excel 참고용 유지)
+    result = api_df
 
     os.makedirs(os.path.dirname(CHARGER_PARQUET), exist_ok=True)
     result.to_parquet(CHARGER_PARQUET, index=False)
